@@ -1,0 +1,84 @@
+// Split Inference gRPC Protocol
+//
+// Extends TenSafe's HAS (Homomorphic Adapter Service) with:
+// - ForwardSplit: Fused single round trip (DP states → base output + encrypted deltas + GateLink)
+// - NegotiateSplit: Device-adaptive split parameter negotiation
+// - UploadEncryptedAdapter: One-time AOE adapter upload
+//
+// Key protocol property: ONE round trip per token (vs 2×N_layers for standard GateLink)
+
+syntax = "proto3";
+
+package split_inference;
+
+service SplitInferenceService {
+  // Core inference RPC: client sends DP-noised hidden states,
+  // server returns base output + all encrypted LoRA deltas + all GateLink signals
+  rpc ForwardSplit(SplitForwardRequest) returns (SplitForwardResponse);
+
+  // Client announces device capabilities, server returns optimal split parameters
+  rpc NegotiateSplit(NegotiateRequest) returns (NegotiateResponse);
+
+  // Client uploads pre-encrypted adapter (AOE: encrypt once, use forever)
+  rpc UploadEncryptedAdapter(UploadAdapterRequest) returns (UploadAdapterResponse);
+}
+
+message SplitForwardRequest {
+  bytes hidden_states = 1;        // DP-noised hidden states [seq_len × hidden_dim], float32
+  repeated int32 token_positions = 2;
+  string adapter_id = 3;
+  string sequence_id = 4;         // For KV-cache tracking
+}
+
+message SplitForwardResponse {
+  bytes base_hidden_states = 1;   // Base model output [seq_len × hidden_dim], float32
+  repeated EncryptedDelta encrypted_deltas = 2;
+  repeated GateLinkSignal gatelink_signals = 3;
+  int32 layers_computed = 4;
+}
+
+message EncryptedDelta {
+  int32 layer_idx = 1;
+  bytes ciphertext = 2;           // CKKS ciphertext (ZeRo-MOAI column-packed)
+  int32 num_elements = 3;
+  double scale = 4;               // CKKS scale factor
+}
+
+message GateLinkSignal {
+  int32 layer_idx = 1;
+  bytes ciphertext = 2;           // Encrypted pre-activation (rank-r vector)
+  int32 gate_rank = 3;
+  string activation_fn = 4;       // "silu", "relu", "gelu"
+}
+
+message NegotiateRequest {
+  string device_type = 1;         // "phone", "laptop", "workstation", "server"
+  float available_ram_gb = 2;
+  bool has_tee = 3;
+  float preferred_epsilon = 4;    // 0 = use server default
+  int32 max_client_layers = 5;    // 0 = use server recommendation
+}
+
+message NegotiateResponse {
+  int32 num_client_layers = 1;    // K: how many layers client should run
+  float epsilon = 2;              // DP noise budget
+  int32 lora_rank = 3;            // Adapter rank for this session
+  string adapter_id = 4;
+  int32 total_model_layers = 5;
+}
+
+message UploadAdapterRequest {
+  string adapter_id = 1;
+  map<int32, bytes> encrypted_B_matrices = 2;  // {layer_idx: CKKS ciphertext}
+  map<int32, bytes> plaintext_A_matrices = 3;  // {layer_idx: serialized numpy}
+  map<int32, bytes> gate_A_matrices = 4;       // {layer_idx: GateLink projection}
+  int32 lora_rank = 5;
+  float lora_alpha = 6;
+  int32 num_layers = 7;
+}
+
+message UploadAdapterResponse {
+  string adapter_id = 1;
+  bool success = 2;
+  string message = 3;
+}

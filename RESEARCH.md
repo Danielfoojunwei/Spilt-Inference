@@ -2,271 +2,380 @@
 
 ## Building on TenSafe
 
-This work extends [TenSafe](https://github.com/Danielfoojunwei/TenSafe-Homormorphically-Encrypted-LoRA-Adaptation) (v4.1.0), which already provides:
-- **HE-LoRA microkernel** — MOAI zero-rotation CKKS compiler + runtime for encrypted LoRA deltas
-- **N2HE CUDA backend** — pybind11 GPU backend (stub, ready for implementation)
-- **Hybrid CKKS+TFHE** — Gated LoRA with LUT-based activations via programmable bootstrapping
-- **Client-server architecture** — HAS (gRPC HE service) + MSS (FastAPI model serving) + vLLM integration
-- **5.76 tok/s** on Llama-3-8B (A100-80GB) with HE-LoRA, vs 2.22 tok/s vanilla HE baseline
-- **FFA-LoRA** — Freeze-A optimization (50% comm reduction)
-- Cost-budgeted compiler (<=16 rotations/token, <=64/layer)
+This work extends [TenSafe](https://github.com/Danielfoojunwei/TenSafe-Homormorphically-Encrypted-LoRA-Adaptation) (v4.1.0), which provides three foundational innovations:
+
+### TenSafe Innovation 1: ZeRo-MOAI (Paper 1)
+**Column-packing that eliminates ALL rotation operations from encrypted LoRA.**
+- Rotations account for >93% of CKKS computation time. LoRA's rank-deficiency (r << d) allows column-packing that avoids rotations entirely.
+- **14.9x speedup** over naive HE-LoRA. Zero Galois keys (eliminates 2.4 GB → 0 MB key material).
+- Rank-independent cost: increasing LoRA rank improves quality with zero additional HE overhead.
+- Setup time: ~25s → <100ms (250x improvement).
+
+### TenSafe Innovation 2: Speculative Batching (Paper 2)
+**Pack K draft tokens into SIMD slots for parallel encrypted verification.**
+- Sequential token generation wastes 99.9% of SIMD capacity (32/4096 slots used).
+- Uses the plaintext base model as a draft model (>95% accurate predictor of adapted output).
+- **3.8x throughput improvement** (56.8x combined with ZeRo-MOAI).
+- K scales to 128 tokens before slot saturation.
+
+### TenSafe Innovation 3: GateLink Protocol (Paper 3)
+**Client-aided non-linear evaluation — zero approximation error.**
+- Problem: Polynomial approximations of SiLU accumulate "cumulative error >= 226 over 36 layers" and cost 2,977 ms/layer.
+- GateLink: Server sends encrypted rank-r pre-activation to client → client decrypts and evaluates exact non-linear function → returns gate bit → server applies gated LoRA.
+- **5.4 ms datacenter round-trip**, 2.2x faster than degree-3 polynomial approximation.
+- Enables gated LoRA: `y = Wx + g(x) * B(Ax)` for conditional expert activation / MoE routing.
+- Eliminates ALL special keys when combined with ZeRo-MOAI.
+
+### TenSafe Baseline Performance (A100, rank r=32)
+
+| Architecture | Llama 8B | HE Overhead | Kimi 2.5 (MoE) | HE Overhead |
+|:---|:---|:---|:---|:---|
+| Standard vLLM (FP16) | 53.18 tok/s | 1.0x | 25.00 tok/s | 1.0x |
+| TenSafe (A100) | 5.76 tok/s | 9.2x | 3.37 tok/s | 7.4x |
+| TenSafe (Groq LPU) | 28.78 tok/s | 1.8x | 7.71 tok/s | 3.2x |
+| Vanilla HE-LoRA | 2.22 tok/s | 24.0x | 0.50 tok/s | 50.0x |
+| Full HE LLM | 0.05 tok/s | 1000x+ | DNF | N/A |
 
 ---
 
-## 1. Why Our Split Inference is Novel
+## 1. The Critical Gap: Hidden State Privacy
 
-### 1.1 The Fundamental Inversion: Encrypt the Personalization, Not the Computation
+### 1.1 The Problem TenSafe Doesn't Solve
 
-**Every SOTA system encrypts the wrong thing.**
+TenSafe protects **adapter weights** (CKKS encryption) and uses **TEE** (hardware trust) for input/base model protection. But:
 
-The entire field — MOAI, ARION, Euston, BOLT, BLB, THOR, BumbleBee — assumes this threat model:
+1. **TEE limits deployment** — Requires Intel SGX/TDX. Most consumer devices (phones, ARM laptops, AMD workstations) lack TEE. TenSafe's input privacy relies on hardware that most users don't have.
 
-```
-SOTA: Client has private INPUT → encrypt input → server runs ENTIRE model on ciphertext
-      Result: BERT-base takes 10-18 minutes. LLaMA-3-8B is impractical.
-```
+2. **Hidden states leak input text** — Research proves that intermediate hidden states can be inverted to reconstruct input tokens:
+   - **Prompt Inversion Attack (CCS 2025)**: >90% reconstruction accuracy across Llama-3.2, Phi-3.5, GPT-2, BERT.
+   - **Constrained Optimization Attack (2025)**: 88.4% token accuracy on Llama-65B from maximum layer inversion.
+   - **Embedding Inversion (Morris et al. 2023)**: 92% recovery of 32-token input from T5 embeddings.
+   - **Diffusion-based attacks (2024)**: 81.3% token recovery without access to target encoder.
 
-They encrypt the **full forward pass**. Every attention head, every FFN, every Softmax, every LayerNorm — all on ciphertext. This is why:
-- NEXUS: 1103 seconds for BERT-base (128 tokens)
-- THOR: 10 minutes on a single GPU
-- BumbleBee: 8.2 minutes + 25.3 GB communication for ONE token of GPT-2
-- Euston (SOTA 2026): Still minutes-scale
+3. **Sending raw hidden states to server = no input privacy.** An adversary with the public embedding matrix can near-perfectly reconstruct input text.
 
-**Our approach inverts this entirely:**
+### 1.2 What's Needed
 
-```
-TenSafe Split: Base model runs in PLAINTEXT (fast, normal speed)
-               Only LoRA adapter deltas run under CKKS (tiny, microsecond-scale)
-               Client handles embedding + sampling (server never sees raw text)
-               Result: 5.76 tok/s TODAY. Target: near-plaintext speed.
-```
+A mechanism that protects input privacy **without TEE** and **without full FHE** (which is 1000x too slow). The mechanism must:
+- Work on commodity hardware (phones, laptops)
+- Add minimal latency (hidden behind base model compute)
+- Have formal mathematical privacy guarantees
+- Compose with TenSafe's existing HE-LoRA pipeline
 
-The insight: **The base model is public. The personalization is private.** So encrypt only the personalization.
-
-### 1.2 What This Means Concretely
-
-| Aspect | SOTA (Full Encrypted Inference) | TenSafe Split Inference |
-|--------|-------------------------------|------------------------|
-| **What's encrypted** | Entire hidden state (d=4096) through every layer | Only LoRA delta (rank 8-32) per layer |
-| **Matrix ops on ciphertext** | QKV projections, FFN, attention scores — all CCMM/PCMM | 2 small PCMM per layer (B@x, A@Bx) |
-| **Nonlinear on ciphertext** | Softmax, GELU, LayerNorm — the hard part | None (base model handles these in plaintext) |
-| **Bootstrapping needed** | Yes, frequently (depth exhausted every few layers) | No (depth 2-3 sufficient for LoRA) |
-| **CKKS parameters** | N=65536, deep modulus chains, massive ciphertexts | N=16384, shallow chain, small ciphertexts |
-| **Per-token latency** | Seconds to minutes | ~812 microseconds (benchmarked) |
-| **Communication** | 15-60 GB per inference (BERT-base) | ~1 MB encrypted adapter weights |
-| **Rotations** | Thousands per inference (MOAI removes 2448, still has hundreds) | <=16 per token (budget-enforced) |
-
-### 1.3 The Three-Way Privacy Split
-
-```
-┌─────────────────────────────────────────────────┐
-│                   CLIENT                         │
-│                                                  │
-│  [1] Tokenize + Embed (PRIVATE — raw text)       │
-│  [2] Run layer 0 (optional warmup)               │
-│           │                                      │
-│           ▼ send hidden states to server          │
-│           │ (these are base-model representations │
-│           │  not raw text — reduced privacy risk) │
-│                                                  │
-│  [5] ◄── receive base output + encrypted delta   │
-│  [6] Decrypt LoRA delta, add to base output      │
-│  [7] Run LM Head + Sampling (PRIVATE — logits)   │
-│           │                                      │
-│           ▼ next token (loop)                    │
-└─────────────────────────────────────────────────┘
-                    │          ▲
-                    ▼          │
-┌─────────────────────────────────────────────────┐
-│                   SERVER                         │
-│                                                  │
-│  [3] Run transformer layers 1..N in PLAINTEXT    │
-│      (base model — public weights, normal speed) │
-│                                                  │
-│  [4] For each layer, compute HE-LoRA delta:      │
-│      ├── Encrypt activations (CKKS)              │
-│      ├── B @ x (PCMM, zero-rotation)             │
-│      ├── A @ Bx (PCMM, zero-rotation)            │
-│      ├── Rescale                                  │
-│      └── Inject encrypted delta into output      │
-│                                                  │
-│  Server NEVER sees:                              │
-│    ✗ Raw text (client embeds locally)             │
-│    ✗ Adapter weights (encrypted under CKKS)       │
-│    ✗ Final logits (client decodes locally)        │
-│    ✗ Sampling distribution (client-side)          │
-│                                                  │
-│  Server DOES see:                                │
-│    ✓ Intermediate hidden states (base model)      │
-│    ✓ Base model weights (public/licensed)         │
-└─────────────────────────────────────────────────┘
-```
-
-**Privacy guarantee:** Server learns the base model's representation of the input (which leaks some info about the input domain), but never learns:
-- The raw text
-- The user's personalized adapter (their private fine-tuning data is protected)
-- The final output distribution (what the model actually says)
-
-This is a **pragmatic privacy model** — not perfect information-theoretic privacy, but enormously practical.
-
-### 1.4 Why No One Else is Doing This
-
-1. **Academic incentive mismatch**: Papers get published by solving the hard crypto problem (full encrypted inference). "Just encrypt the adapter" seems too simple for a top-tier venue.
-
-2. **Threat model assumption**: Most papers assume the server is adversarial with respect to the INPUT. We assume the server is adversarial with respect to the PERSONALIZATION. Different threat, different solution.
-
-3. **LoRA wasn't mainstream until 2023-2024**: The older HE inference papers (Iron 2022, BOLT 2024) predate the LoRA explosion. They didn't have "encrypt only the adapter" as an option.
-
-4. **The split was missing**: Even papers that use LoRA+HE (PrivTuner, Encryption-Friendly LLM) don't combine it with a client-side embedding/sampling split. They still encrypt the full input.
+**Solution: Differential Privacy (DP) noise on hidden states**, validated by:
+- **Split-and-Denoise (SnD, ICML 2024)**: Correlation drops below 0.005 with calibrated noise.
+- **DEL (2025)**: Projection + DP quantization overcomes curse of dimensionality.
+- **NVDP (2025)**: Variational information bottleneck with Rényi DP guarantees.
 
 ---
 
-## 2. New Directions: Efficient, Cheap, Any-Device Split Inference
+## 2. Novel Architecture: DP-HE Three-Layer Split
 
-### 2.1 Direction 1: "Adapter-Only Encryption" (AOE)
+### 2.1 The Core Insight
 
-**Core thesis:** Don't encrypt hidden states at all. Encrypt ONLY the adapter weights.
+**Use the RIGHT tool for each privacy threat:**
 
-```
-Current TenSafe:  encrypt(activations) → PCMM with plaintext weights → decrypt(delta)
-Proposed AOE:     plaintext activations → PCMM with encrypt(adapter weights) → encrypted delta → client decrypts
-```
+| Threat | Protection | Mechanism | Guarantee | Overhead |
+|--------|-----------|-----------|-----------|----------|
+| Server reconstructs input tokens | DP noise on hidden states | Calibrated Gaussian noise before transmission | ε-differential privacy | ~0 (noise addition is free) |
+| Server learns adapter weights | CKKS HE via ZeRo-MOAI | Encrypted B matrices, zero-rotation PCMM | IND-CPA under RLWE | ~812 μs/layer |
+| Server learns output distribution | Client-side LM head + sampling | Logits never transmitted | Information-theoretic | ~1-5 ms |
+| Non-linear approx error | GateLink protocol | Client-side exact evaluation | Zero error | Piggybacked on split round trip |
 
-This flips PCMM: instead of `plaintext_weight × ciphertext_activation`, do `ciphertext_weight × plaintext_activation`. Both are PCMM — same cost, same zero-rotation guarantee. But now:
+**No existing system combines all four.** Full FHE systems (MOAI, ARION, Euston) encrypt everything at 1000x overhead. Split learning systems (SnD, DEL) protect input but not adapters. HE-LoRA systems (CryptPEFT, PrivTuner) protect adapters but not input. We provide **three-layer privacy at near-plaintext speed.**
 
-- **No per-token encryption/decryption on client** — adapter weights encrypted once at upload
-- **Server stores encrypted adapters** — serves them to any request
-- **Client only decrypts the final delta** — one small decryption per layer per token
-- **Adapter weights are static** — encrypt once, use forever (amortized cost → zero)
-
-**Why this is huge for any-device:**
-- Client doesn't need to encrypt anything at inference time
-- Client only needs CKKS decryption capability (much lighter than encryption)
-- A phone can be the client — just decrypt small deltas
-
-### 2.2 Direction 2: Progressive Privacy Tiers
-
-Not every user needs the same privacy level. Offer tiers:
-
-| Tier | Client Runs | Encrypted | Overhead | Device |
-|------|------------|-----------|----------|--------|
-| **Tier 0**: No privacy | Nothing | Nothing | 0% | Any (API call) |
-| **Tier 1**: Adapter privacy | Nothing extra | LoRA weights only (AOE) | ~2-5% | Phone/laptop |
-| **Tier 2**: Input+Adapter privacy | Embed + LM head | LoRA weights + embed split | ~10-15% | Laptop |
-| **Tier 3**: Full split | Embed + first/last N layers + sampling | LoRA + hidden states at split boundary | ~50-90% | Workstation |
-| **Tier 4**: Full encrypted | Everything | Full inference under FHE | 100-1000x | Research only |
-
-**Users choose their tier based on their device and threat model.** The compiler generates different schedules for each tier. This is a product insight, not just a research one.
-
-### 2.3 Direction 3: Streaming Delta Injection (SDI)
-
-Instead of one big encrypted round-trip, **stream tiny encrypted corrections alongside the plaintext forward pass:**
+### 2.2 Architecture Diagram
 
 ```
-Layer 1: base_output_1 = transformer_layer_1(x)        # plaintext, fast
-         delta_1 = HE_LoRA(x, encrypted_A1, encrypted_B1)  # CKKS, parallel
-         output_1 = base_output_1 + decrypt(delta_1)
-
-Layer 2: base_output_2 = transformer_layer_2(output_1)  # plaintext, fast
-         delta_2 = HE_LoRA(output_1, encrypted_A2, encrypted_B2)  # CKKS, parallel
-         ...
+┌─────────────────────────────────────────────────────────────────┐
+│                          CLIENT                                  │
+│  (phone/laptop/workstation — 1-2 GB RAM)                         │
+│                                                                  │
+│  tokens = tokenize(input_text)              # Private, local     │
+│  h_0 = embedding(tokens)                    # Private, local     │
+│  h_K = transformer_layers[0:K](h_0)         # K=1-2 layers       │
+│  noise = dp_gaussian(ε, δ, sensitivity)     # DP mechanism        │
+│  h_sent = h_K + noise                       # ε-DP protected     │
+│         │                                                        │
+│         ▼  ──── ONE request per token ────────────────►          │
+│                                                                  │
+│  h_base       ◄── base model output (plaintext)                  │
+│  enc_deltas[] ◄── encrypted LoRA deltas (CKKS ciphertexts)       │
+│  pre_gates[]  ◄── encrypted pre-activations (GateLink, rank-r)   │
+│                                                                  │
+│  For each layer i:                                               │
+│    gate_i = exact_nonlinear(decrypt(pre_gates[i]))  # GateLink   │
+│    delta_i = decrypt(enc_deltas[i])                  # CKKS       │
+│    gated_delta_i = gate_i * delta_i                  # Gated LoRA │
+│                                                                  │
+│  h_final = h_base + Σ gated_delta_i                              │
+│  logits = lm_head(h_final)                  # Private, local     │
+│  next_token = sample(logits, top_p)         # Private, local     │
+│         │                                                        │
+│         ▼  loop for autoregressive generation                    │
+└─────────────────────────────────────────────────────────────────┘
+                     │                    ▲
+                     ▼                    │
+┌─────────────────────────────────────────────────────────────────┐
+│                          SERVER                                  │
+│  (GPU — A100/H200/4090)                                          │
+│                                                                  │
+│  h_sent ◄── receive DP-noised hidden states                      │
+│                                                                  │
+│  ┌─── BASE PATH (plaintext, full GPU speed) ─────────────┐      │
+│  │  For each layer i in K..N:                             │      │
+│  │    h_i = transformer_layer_i(h_{i-1})   # Normal fwd  │      │
+│  │  h_base = h_N                                         │      │
+│  └───────────────────────────────────────────────────────┘      │
+│                                                                  │
+│  ┌─── HE-LORA PATH (parallel, encrypted) ────────────────┐      │
+│  │  For each layer i in K..N:                             │      │
+│  │    x_i = h_i from base path                            │      │
+│  │    z_i = encrypted_B_i @ x_i     # PCMM (ZeRo-MOAI)  │      │
+│  │    delta_i = A_i @ z_i           # PCMM (A plaintext) │      │
+│  │    pre_gate_i = A_gate_i @ z_i   # GateLink signal    │      │
+│  └───────────────────────────────────────────────────────┘      │
+│                                                                  │
+│  Send: h_base + [enc_delta_i] + [pre_gate_i]  ────────►         │
+│                                                                  │
+│  Server NEVER sees:                                              │
+│    ✗ Raw tokens (client embeds locally)                           │
+│    ✗ Clean hidden states (only DP-noised version)                 │
+│    ✗ Adapter weights (encrypted under CKKS)                       │
+│    ✗ Gate decisions (client evaluates locally)                     │
+│    ✗ Output logits or sampled tokens (client-side)                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The HE computation for layer N can overlap with the plaintext computation for layer N+1. This is **pipeline parallelism for HE** — the LoRA deltas are computed in a parallel stream and injected as they become ready.
+### 2.3 Key Protocol Property: Single Round Trip
 
-**Latency impact:** If HE-LoRA per layer takes ~812 us and base layer takes ~500 us, the HE computation is nearly hidden behind the base forward pass. Total overhead approaches the single-layer HE cost, not the sum.
+**Standard GateLink** requires 2 × N_layers round trips per token:
+- Per layer: server sends pre-activation → client returns gate bit → server applies
 
-### 2.4 Direction 4: Encrypted Adapter Marketplace
+**Our fused protocol** collapses this to **ONE round trip per token**:
+1. Client → Server: DP-noised `h_sent` (one transmission)
+2. Server: runs base model + computes ALL encrypted LoRA data (parallel path)
+3. Server → Client: `h_base` + all `enc_delta_i` + all `pre_gate_i` (one response)
+4. Client: decrypts everything locally, evaluates gates, combines, samples
 
-If adapter weights are encrypted and the server never sees them:
+This works because the **parallel adapter path** decouples LoRA from the base forward pass. All layers' pre-activations and deltas are available after one base model forward pass — no sequential gate-bit exchange needed.
 
-- **Users can upload private adapters** fine-tuned on their proprietary data
-- **Multiple users share the same base model** (server-side) with different encrypted adapters
-- **Adapters become portable, private assets** — users can switch providers without exposing their fine-tuning
-- **No adapter theft possible** — server cannot extract adapter weights from ciphertexts
-
-This is a **business model**, not just a privacy feature. Think "bring your own encrypted adapter" to any cloud LLM provider.
-
-### 2.5 Direction 5: Client-Adaptive Compilation
-
-TenSafe's compiler already produces cost-budgeted schedules. Extend it:
-
-```python
-# Compiler profiles based on client capability
-profiles = {
-    "phone":       {"max_rotations": 4,  "max_depth": 1, "tier": "AOE"},
-    "laptop":      {"max_rotations": 8,  "max_depth": 2, "tier": "split"},
-    "workstation": {"max_rotations": 16, "max_depth": 3, "tier": "full_split"},
-    "server":      {"max_rotations": 64, "max_depth": 5, "tier": "research"},
-}
-```
-
-The client announces its capability → server selects the pre-compiled schedule → adapts the split point, encryption parameters, and LoRA rank dynamically.
-
-**Key insight:** LoRA rank can be reduced (rank 32 → rank 4) to fit weaker devices. Lower rank = fewer HE operations = faster. The quality loss from rank reduction is often acceptable.
-
-### 2.6 Direction 6: FFA-LoRA + Quantized HE
-
-TenSafe already implements FFA-LoRA (Freeze-A). Push further:
-
-- **A matrix**: public, plaintext, frozen — zero HE cost
-- **B matrix**: encrypted — but quantize to 4-bit before encrypting
-- **Effect**: 4-bit B matrix packs 8x more values per CKKS slot (8192 slots → 65K values)
-- **Combined**: 50% reduction (FFA) × 8x packing (quant) = **16x less HE work**
-
-At 16x reduction, the ~812 us per-layer HE cost drops to ~50 us — completely hidden behind base model latency. **HE overhead effectively disappears.**
+**Communication reduction: 2 × N_layers → 1 round trip per token** (e.g., 64 → 1 for a 32-layer model).
 
 ---
 
-## 3. SOTA Landscape (Context for Positioning)
+## 3. Novel Contributions (Paper-Ready)
 
-### 3.1 Pure FHE — What We're NOT Doing (and Why)
+### Contribution 1: DP-HE Three-Layer Privacy Architecture
+
+**First system combining DP (input) + HE (adapter) + local compute (output).**
+
+Full FHE encrypts everything → impractical (1000x overhead). Split learning adds DP noise → protects input but not adapters. HE-LoRA encrypts adapters → protects adapters but not input. We compose all three at <10x overhead.
+
+**Formal guarantees:**
+- Input: ε-differential privacy (tunable ε per device)
+- Adapter: IND-CPA security under Ring-LWE
+- Output: information-theoretic (never transmitted)
+
+**Why novel:** No prior system achieves all three simultaneously. CryptPEFT (2024) is closest — confines privacy to adapters but provides NO input protection. SnD (ICML 2024) protects input but provides NO adapter protection.
+
+### Contribution 2: GateLink-Fused Single-Round-Trip Protocol
+
+**Collapse GateLink's multi-round gate exchange into one request-response.**
+
+Standard GateLink: 2N round trips per token (send pre-activation, receive gate bit, per layer).
+Our protocol: 1 round trip per token (send DP states, receive everything).
+
+This is possible because:
+1. **Parallel adapter path** — base model runs all layers first, then all HE-LoRA data is available
+2. **Client-side gate evaluation** — client already has decryption key, so it evaluates gates locally
+3. **GateLink data piggybacks** — pre-activations and deltas ride the same response as h_base
+
+**Latency improvement:** For 32-layer model on datacenter network (5.4ms RTT per GateLink exchange): Standard GateLink = 32 × 5.4ms = 172.8ms. Our protocol = 1 × ~10ms = 10ms. **17x reduction in protocol overhead.**
+
+### Contribution 3: Adapter-Only Encryption with ZeRo-MOAI
+
+**Encrypt adapter weights once at upload, not activations per-token.**
+
+Standard HE-LoRA: encrypt(activations) → PCMM with plaintext weights → decrypt(delta).
+AOE: plaintext activations → PCMM with encrypt(adapter weights) → encrypted delta → client decrypts.
+
+Both are PCMM — same cost under ZeRo-MOAI's column packing. But AOE eliminates:
+- Per-token client-side encryption (costly on phones)
+- Key management per session (adapter encrypted once, stored on server)
+- Bandwidth for per-token ciphertext upload (adapters uploaded once)
+
+Combined with FFA-LoRA (freeze-A): only B matrices are encrypted. A is public/plaintext. Per-token cost = N_layers × (1 PCMM + 1 decrypt). Client needs only CKKS decryption — much lighter than encryption.
+
+### Contribution 4: DP-Aware Speculative Batching
+
+**Speculative batching works with DP-noised input because the client can draft on clean data.**
+
+The key insight: in our split, the client has the CLEAN hidden states h_K (before noise). The client can:
+1. Run a lightweight draft model (or the same K client layers + a small head) on clean h_K
+2. Draft K candidate tokens
+3. Pack K tokens' DP-noised states into one SIMD ciphertext
+4. Server verifies all K in one encrypted forward pass
+
+This preserves TenSafe's 3.8x speculative batching speedup while adding DP protection. The drafting happens on clean data (client-side), so draft quality isn't degraded by DP noise. Only the verification happens on noisy data, where the LoRA delta corrections still match because they're computed on the same noisy states the base model saw.
+
+### Contribution 5: Device-Adaptive Privacy Compilation
+
+**Joint optimization of (ε, K, rank, block_size) per device capability.**
+
+| Profile | K (client layers) | ε (DP budget) | LoRA rank | Client RAM | Expected overhead |
+|---------|-------------------|---------------|-----------|------------|-------------------|
+| Phone | 1 | 1.0 | 4 | 1.5 GB | ~8x |
+| Laptop | 1 | 4.0 | 8 | 3.0 GB | ~5x |
+| Workstation | 2 | 8.0 | 16 | 6.0 GB | ~3x |
+| Server (no TEE) | 4 | 16.0 | 32 | 16.0 GB | ~2x |
+| Server (with TEE) | 0 | ∞ (TEE) | 32 | 0 (TEE) | ~1.5x |
+
+The compiler generates device-specific split schedules. Lower-capability devices get more DP noise (stronger privacy, more quality loss) and lower LoRA rank (less HE work). This is a continuous trade-off, not a binary choice.
+
+### Contribution 6: Parallel Encrypted Adapter Injection
+
+**Decoupled base path and HE-LoRA path for pipeline parallelism.**
+
+Research validates minimal quality loss from parallel adapter injection:
+- **Side-Tuning (ECCV 2020)**: Best average rank across benchmarks with fully decoupled adapter.
+- **MAM Adapters (ICLR 2022)**: Parallel config = "best among adapter/prompt methods."
+- **LLaMA-Adapter (ICLR 2024)**: Zero-init parallel injection matches full fine-tuning.
+
+In our system: base forward pass and HE-LoRA computation run as independent streams on the GPU. The base path feeds hidden states to the HE-LoRA path (one-way dependency), but HE-LoRA output doesn't feed back into the base path. This enables:
+- True pipeline overlap (base layer N+1 overlaps with HE-LoRA layer N)
+- Single-pass base model computation (no wait for HE results between layers)
+- All HE data available at end of forward pass (enabling single round trip)
+
+---
+
+## 4. Composing TenSafe Innovations in Split Inference
+
+### 4.1 How Each TenSafe Innovation Maps to Split Inference
+
+| TenSafe Innovation | Role in Split Inference | What Split Inference Adds |
+|---|---|---|
+| **ZeRo-MOAI** | Server-side encrypted LoRA computation (zero rotations, zero keys) | AOE mode: encrypt weights not activations. Same PCMM, flipped operands |
+| **Speculative Batching** | Pack K draft tokens for parallel encrypted verification | Client-side drafting on clean data (before DP noise) preserves draft quality |
+| **GateLink** | Non-linear gate evaluation for gated LoRA | Fused into single round trip — client evaluates ALL gates locally, no per-layer exchange |
+| **TEE base model** | Hardware trust for input + base model protection | **REPLACED by DP noise** for commodity hardware. TEE remains optional for maximum speed |
+| **FFA-LoRA (Freeze-A)** | 50% communication reduction (only B is private) | Combined with AOE: only B encrypted at upload, A is always plaintext |
+| **HAS gRPC service** | Client-server communication protocol | Extended with `ForwardSplit` RPC, `NegotiateSplit`, `UploadEncryptedAdapter` |
+| **Cost-budgeted compiler** | ≤16 rotations/token, ≤64/layer enforcement | Extended with privacy budget parameters (ε, K, device profile) |
+
+### 4.2 The Full Innovation Stack
+
+```
+┌────────────────────────────────────────────────────┐
+│  Device-Adaptive Compiler (Contribution 5)          │  ← NEW: Joint (ε,K,rank) optimization
+│  Extends TenSafe cost-budgeted compiler             │
+├────────────────────────────────────────────────────┤
+│  DP-HE Three-Layer Protocol (Contribution 1)        │  ← NEW: DP + HE + local compute
+│  Fused Single Round Trip (Contribution 2)           │  ← NEW: Collapses GateLink exchanges
+├────────────────────────────────────────────────────┤
+│  Parallel Adapter Injection (Contribution 6)        │  ← NEW: Decoupled base + HE-LoRA paths
+│  DP-Aware Speculative Batching (Contribution 4)     │  ← NEW: Client-side clean drafting
+├────────────────────────────────────────────────────┤
+│  GateLink Protocol                                  │  ← FROM TENSAFE: Non-linear gates
+│  ZeRo-MOAI PCMM                                    │  ← FROM TENSAFE: Zero-rotation engine
+│  Speculative Batching                               │  ← FROM TENSAFE: SIMD utilization
+│  FFA-LoRA / AOE (Contribution 3)                    │  ← EXTENDED: Adapter-only encryption
+├────────────────────────────────────────────────────┤
+│  CKKS Crypto Backend (Pyfhel / N2HE)               │  ← FROM TENSAFE: HE primitives
+│  HAS gRPC Service                                   │  ← FROM TENSAFE: Communication layer
+│  vLLM Adapter + Hook Manager                        │  ← FROM TENSAFE: Base model serving
+└────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Why This Matters: The Deployment Story
+
+### 5.1 TenSafe's Current Limitation
+
+TenSafe achieves 5.76 tok/s on A100 — impressive for HE, but requires:
+- Server with TEE (Intel SGX/TDX) for input privacy
+- Client capable of CKKS encryption per token
+- Datacenter-class networking for GateLink round trips
+
+This limits deployment to: **enterprise datacenter ↔ enterprise client.**
+
+### 5.2 What Split Inference Enables
+
+**Any device, any network, practical privacy:**
+
+| Scenario | Before (TenSafe) | After (Split Inference) |
+|----------|------------------|------------------------|
+| Phone user | Impossible (no TEE, no encryption capability) | Works: embed + 1 layer + DP noise + decrypt only |
+| Consumer laptop | Marginal (no TEE on most laptops) | Works: DP noise replaces TEE requirement |
+| Edge/IoT | Impossible | Works (Tier 1): adapter-only encryption, no client-side layers |
+| Enterprise datacenter | Works (current TenSafe) | Faster: parallel adapter + single round trip |
+| Air-gapped / high-security | Requires TEE procurement | Works: DP provides mathematical guarantee, no hardware dependency |
+
+### 5.3 Expected Performance (Projected)
+
+| Configuration | Throughput | Privacy Level | Target Device |
+|---|---|---|---|
+| Split + DP(ε=1) + AOE + r=4 | ~8-15 tok/s | Strong (ε=1 DP + HE adapter) | Phone |
+| Split + DP(ε=4) + AOE + r=8 | ~15-30 tok/s | Moderate (ε=4 DP + HE adapter) | Laptop |
+| Split + DP(ε=8) + parallel + r=16 | ~30-45 tok/s | Light DP + HE adapter | Workstation |
+| Split + TEE + parallel + r=32 | ~40-50 tok/s | Full (TEE + HE adapter) | Server |
+| Vanilla vLLM (no privacy) | 53.18 tok/s | None | Reference |
+
+---
+
+## 6. SOTA Landscape
+
+### 6.1 Pure FHE — What We're NOT Doing (and Why)
 
 | System | Venue | Latency | Why We Diverge |
 |--------|-------|---------|----------------|
-| [NEXUS](https://eprint.iacr.org/2024/136.pdf) | NDSS 2025 | ~1103s (CPU) | Encrypts entire model — impractical |
-| [MOAI](https://eprint.iacr.org/2025/991) | ePrint 2025 | Best GPU pure FHE | We use MOAI's zero-rotation technique, but only for LoRA delta, not full model |
-| [ARION](https://eprint.iacr.org/2025/2271) | ePrint 2025 | 2.5x faster than MOAI | Double-BSGS useful if we ever need encrypted attention |
-| [Euston](https://eprint.iacr.org/2026/046) | S&P 2026 | SOTA pure FHE | SVD decomposition idea applicable to LoRA weight encoding |
+| [NEXUS](https://eprint.iacr.org/2024/136.pdf) | NDSS 2025 | ~1103s (CPU) | Encrypts entire model |
+| [MOAI](https://eprint.iacr.org/2025/991) | ePrint 2025 | Best GPU pure FHE | We use MOAI's zero-rotation for LoRA only |
+| [ARION](https://eprint.iacr.org/2025/2271) | ePrint 2025 | 2.5x faster than MOAI | Double-BSGS useful for future encrypted attention |
+| [Euston](https://eprint.iacr.org/2026/046) | S&P 2026 | SOTA pure FHE | SVD decomposition applicable to adapter encoding |
 | [STIP](https://eprint.iacr.org/2026/174) | ePrint 2026 | 1.6x faster than Euston | Compact packing ideas reusable |
 
-**We borrow their techniques (zero-rotation, column packing, SIMD batching) but apply them to a 100-1000x smaller problem (LoRA delta vs full forward pass).**
+### 6.2 Split Learning + Privacy
 
-### 3.2 Hybrid HE+MPC — Relevant for Gated LoRA Path
+| System | Venue | What it Does | Gap We Fill |
+|--------|-------|-------------|-------------|
+| [Split-and-Denoise (SnD)](https://arxiv.org/abs/2310.09130) | ICML 2024 | DP noise on embeddings + denoising | No adapter protection |
+| [DEL](https://arxiv.org/html/2602.11513) | arXiv 2025 | Projection + DP quantization | No adapter protection |
+| [PrivDFS](https://arxiv.org/html/2508.04346v1) | arXiv 2025 | Feature partitioning across servers | Requires non-colluding servers |
+| [Eguard](https://arxiv.org/abs/2411.05034) | arXiv 2024 | Embedding projection + MI optimization | No adapter protection |
 
-| System | Venue | Relevance to Us |
-|--------|-------|----------------|
-| [BLB](https://eprint.iacr.org/2025/1532) | USENIX Security 2025 | CKKS↔MPC bridge protocol — useful for our CKKS↔TFHE bridge |
-| [CryptoGen](https://arxiv.org/abs/2602.08798) | arXiv 2025 | Encrypted KV-cache reuse — directly applicable to our autoregressive loop |
-| [Cachemir](https://arxiv.org/abs/2602.11470) | arXiv 2025 | FHE-only KV cache — alternative approach for our pipeline |
-| [BOLT](https://www.semanticscholar.org/paper/BOLT:-Privacy-Preserving,-Accurate-and-Efficient-Pang-Zhu/0f7bbe9837026560a934de8a74d233678bd55f57) | S&P 2024 | Baseline everyone beats |
-| [BumbleBee](https://www.ndss-symposium.org/wp-content/uploads/2025-57-paper.pdf) | NDSS 2025 | Ciphertext interleaving — applicable to our batch packing |
+### 6.3 HE-LoRA / Adapter Privacy
 
-### 3.3 NTU DTC / HintSight Lineage — Our Direct Ancestors
+| System | Venue | What it Does | Gap We Fill |
+|--------|-------|-------------|-------------|
+| [CryptPEFT](https://arxiv.org/abs/2412.08145) | arXiv 2024 | Confine privacy to adapters only | No input protection |
+| [PrivTuner](https://arxiv.org/abs/2410.00433) | arXiv 2024 | FHE + LoRA fine-tuning | Training only, not inference. No input protection |
+| TenSafe v4.1.0 | — | HE-LoRA + GateLink + speculative batching | Requires TEE for input protection |
 
-| Paper | What We Inherit |
-|-------|----------------|
-| [Hybrid PP-NN (NTU/HintSight, TDSC 2024)](https://eprint.iacr.org/2023/647) | **Split DNN architecture** — plaintext open network (client) + ciphertext private network (server). The foundational idea. |
-| [MOAI (NTU DTC, ePrint 2025)](https://eprint.iacr.org/2025/991) | **Zero-rotation PCMM** — column packing, rotation-free Softmax/LayerNorm. TenSafe's compiler already implements this. |
-| [PrivTuner (NTU, arXiv 2024)](https://arxiv.org/abs/2410.00433) | **FHE + LoRA** — privacy-preserving parameter-efficient fine-tuning. Direct predecessor to TenSafe's HE-LoRA. |
-| [NTU Hybrid PP-NN portal](https://www.ntu.edu.sg/innovates/tech-portal/tech-offers/detail/new-model-hybrid-privacy-preserving-neural-networks) | **HintSight commercialization** — LUT-based nonlinear evaluation, <1s inference. |
+### 6.4 Parallel Adapters (Quality Validation)
 
-**N2HE context:** TenSafe already has `scripts/n2he/` (build scripts) and `src/he_lora_microkernel/n2he/` (backend module) — N2HE is TenSafe's **own native CUDA HE backend**, not a separate paper. It stands for the Native-Node Homomorphic Encryption GPU kernel library used by the HE-LoRA microkernel.
+| System | Venue | Finding |
+|--------|-------|---------|
+| [Side-Tuning](https://arxiv.org/abs/1912.13503) | ECCV 2020 | Decoupled adapter achieves best avg rank across benchmarks |
+| [MAM Adapters](https://openreview.net/forum?id=0RDcd5Axok) | ICLR 2022 | Parallel adapter = "best among adapter/prompt methods" |
+| [LLaMA-Adapter](https://arxiv.org/abs/2303.16199) | ICLR 2024 | Zero-init parallel injection matches full fine-tuning |
+| [Symbiosis](https://arxiv.org/html/2507.03220v1) | arXiv 2025 | Systems-level decoupling for multi-adapter serving |
 
-### 3.4 Architecture-Level Innovations We Can Leverage
+### 6.5 Hidden State Attacks (Threat Validation)
 
-| Paper | Technique | How We Use It |
-|-------|-----------|---------------|
-| [Encryption-Friendly LLM (ICLR 2025)](https://arxiv.org/abs/2410.02486) | Gaussian kernel attention (replace softmax), LoRA avoids CCMM | If we ever need encrypted attention (Tier 3+), use GK instead of polynomial softmax |
-| [StriaNet (arXiv 2025)](https://arxiv.org/abs/2601.21287) | ExRot-Free convolution, Cross Kernel | Applicable to conv-based adapter layers if we add them |
-| [CryptPEFT](https://arxiv.org/abs/2412.08145) | Confine privacy to adapters only | Validates our core thesis — 20-291x speedup over encrypting everything |
-| [Split HE (arXiv 2022)](https://arxiv.org/abs/2202.13351) | SplitNN + TFHE, 3-part model split | Original split idea, but with full encryption — we do it lighter |
+| Attack | Venue | Result |
+|--------|-------|--------|
+| [Prompt Inversion](https://dl.acm.org/doi/pdf/10.1145/3719027.3744820) | CCS 2025 | >90% token reconstruction from hidden states |
+| [Constrained Optimization](https://arxiv.org/html/2503.09022v1) | arXiv 2025 | 88.4% token accuracy on Llama-65B |
+| [Embedding Inversion](https://arxiv.org/html/2405.11916) | arXiv 2024 | 92% recovery from T5 embeddings |
+| [Model Inversion in Split Learning](https://arxiv.org/html/2501.05965) | arXiv 2025 | Information bottleneck analysis of split point privacy |
 
 ---
 
-## 4. TenSafe Components We Build On
+## 7. TenSafe Components We Build On
 
-### 4.1 Already Implemented (in TenSafe)
+### 7.1 Already Implemented (in TenSafe)
 
 | Component | Location | Status |
 |-----------|----------|--------|
@@ -279,97 +388,52 @@ At 16x reduction, the ~812 us per-layer HE cost drops to ~50 us — completely h
 | Gated LoRA (CKKS+TFHE) | `hybrid_compiler/gated_lora/` | Working |
 | CKKS↔TFHE bridge | `hybrid_compiler/bridge/` | Working |
 | TFHE LUT activations | `hybrid_compiler/tfhe_lut/` | Working (ReLU, GELU, Sigmoid) |
+| GateLink gate evaluator | `client/gate_evaluator.py` | Working |
 | HAS gRPC server | `services/has/` | Working |
 | MSS REST API | `services/mss/` | Working |
 | vLLM adapter | `backend/vllm_adapter/` | Working (hook-based delta injection) |
 | TenSafe Python client | `client/client.py` | Working |
 | TypeScript SDK | `sdk/typescript/` | Working |
 | N2HE CUDA backend | `he_lora_microkernel/n2he/` | Stub (architecture defined) |
-| GPU CKKS backend | `backend/gpu_ckks_backend.py` | Stub (SimulationBackend working) |
 
-### 4.2 What Split Inference Adds
+### 7.2 What Split Inference Adds
 
 | New Component | Purpose | Builds On |
 |---------------|---------|-----------|
-| **Client-side embedding layer** | Tokenize + embed locally, never send raw text | TenSafe client SDK |
-| **Client-side LM head + sampler** | Decode logits locally, server never sees output distribution | New |
-| **Split-point negotiation** | Client announces capability → server adapts split | HAS protocol extension |
-| **Streaming delta injection** | Pipeline HE-LoRA parallel to base forward pass | Runtime executor extension |
-| **Adapter-Only Encryption mode** | Encrypt adapter weights at upload, not per-token | Compiler + key manager |
-| **Progressive privacy tiers** | Tier 0-4 compilation profiles | Cost model extension |
-| **Encrypted KV-cache** | Reuse LoRA delta KV contributions across tokens | New (CryptoGen-inspired) |
-| **Client-adaptive compiler** | Device-specific schedule generation | Compiler profiles extension |
+| **Client model shard** | Embed + K layers + LM head (lightweight client runtime) | HuggingFace model loading |
+| **DP noise injector** | Calibrated Gaussian noise for hidden state privacy | New (SnD-inspired) |
+| **GateLink-fused split protocol** | Single round trip carrying DP states + deltas + gates | GateLink + HAS extension |
+| **Parallel HE-LoRA executor** | Decoupled adapter path for pipeline parallelism | TenSafe executor extension |
+| **Adapter-Only Encryption mode** | Encrypt adapter weights at upload, not per-token | Compiler + PCMM mode flip |
+| **Device-adaptive compiler** | Joint (ε, K, rank) optimization per device | Cost model extension |
+| **DP-aware speculative batcher** | Client-side clean drafting + SIMD packing | Speculative batching extension |
+| **Split negotiation RPC** | Client capability → server adapts protocol | HAS protocol extension |
 
 ---
 
-## 5. Implementation Plan
+## 8. Implementation Plan
 
-### Phase 1: Client-Side Embedding & Sampling Split
-- [ ] Extract embedding layer + LM head from target model (Llama-3-8B)
-- [ ] Package as lightweight client runtime (PyTorch inference-only, no training)
-- [ ] Client sends post-embedding hidden states to server via existing HAS gRPC
-- [ ] Client receives pre-LM-head hidden states + decrypted LoRA delta
-- [ ] Client runs LM head + sampling locally
-- [ ] Benchmark: measure overhead of split vs. current TenSafe flow
-- [ ] Validate: server never sees raw tokens or output logits
+### Phase 1: Project Setup & Client Model Shard
+Extract embedding + K transformer layers + LM head from HuggingFace model as lightweight client runtime (~1-2 GB for Llama-3-8B K=1).
 
-### Phase 2: Adapter-Only Encryption (AOE)
-- [ ] Implement "encrypt weights, not activations" mode in compiler
-- [ ] Modify PCMM to `ciphertext_weight × plaintext_activation`
-- [ ] Adapter weights encrypted once at upload (amortized cost)
-- [ ] Client only needs decryption at inference time
-- [ ] Benchmark: compare per-token latency vs current encrypt-activations mode
-- [ ] Target: <100 us overhead per layer (hidden behind base model latency)
+### Phase 2: DP Noise Injection
+Calibrated Gaussian mechanism for hidden state privacy. ε-DP guarantees with auto-calibrated sensitivity.
 
-### Phase 3: Streaming Delta Injection (Pipeline Parallelism)
-- [ ] Modify runtime executor to overlap HE-LoRA with base forward pass
-- [ ] Layer N HE-LoRA runs concurrently with layer N+1 base forward
-- [ ] Implement async delta injection into vLLM adapter hooks
-- [ ] Benchmark: measure effective overhead (should approach single-layer HE cost)
+### Phase 3: GateLink-Fused Split Protocol
+Extend HAS gRPC with `ForwardSplit` RPC. Server returns h_base + encrypted deltas + GateLink pre-activations in one response. Client evaluates all gates locally.
 
-### Phase 4: Progressive Privacy Tiers
-- [ ] Define tier profiles (phone/laptop/workstation/server)
-- [ ] Compiler generates tier-specific schedules
-- [ ] Client capability negotiation in HAS protocol
-- [ ] Adaptive LoRA rank reduction for weaker devices
-- [ ] FFA-LoRA + quantized HE integration (16x reduction path)
+### Phase 4: Parallel HE-LoRA Executor
+Decoupled base path and adapter path. Pipeline overlap. Uses TenSafe's ZeRo-MOAI PCMM engine.
 
-### Phase 5: N2HE GPU Backend (Production Performance)
-- [ ] Implement N2HE CUDA kernels (currently stub)
-- [ ] Zero-rotation PCMM on GPU
-- [ ] Batched encrypt/decrypt for streaming
-- [ ] Benchmark on A100/H200 vs Pyfhel CPU baseline
-- [ ] Target: 10x+ speedup over CPU backend
+### Phase 5: Device-Adaptive Compiler
+Joint optimization of privacy and performance parameters per device profile. Extends TenSafe cost model.
+
+### Phase 6: End-to-End Integration & Benchmarks
+Wire everything, validate privacy guarantees (prompt inversion attack on DP-noised states), measure throughput.
 
 ---
 
-## 6. Competitive Positioning
-
-```
-                        Privacy Level
-                    Full FHE ◄──────────────────► No Privacy
-                        │                              │
-                        │  MOAI/ARION/Euston            │  Standard vLLM
-                        │  (minutes per token)          │  (53 tok/s)
-                        │                              │
-                        │         ┌──────────┐         │
-                        │         │ TenSafe  │         │
-                        │         │  Split   │         │
-                        │         │ Inference│         │
-                        │         └──────────┘         │
-                        │    (5-50 tok/s, practical     │
-                        │     privacy, any device)      │
-                        │                              │
-                   ◄────┼──────────────────────────────┼────►
-              Impractical│      Sweet Spot              │ No Protection
-                        │                              │
-```
-
-**Our position:** We sacrifice theoretical perfect privacy (the server sees base-model hidden states) for **1000x better performance**. The privacy we DO provide — protecting the adapter (user's private fine-tuning) and raw text/output — covers the practical threat model for most real-world deployments.
-
----
-
-## 7. Key References
+## 9. Key References
 
 ### Our Direct Lineage
 1. [TenSafe — HE-LoRA Platform](https://github.com/Danielfoojunwei/TenSafe-Homormorphically-Encrypted-LoRA-Adaptation)
@@ -377,32 +441,28 @@ At 16x reduction, the ~812 us per-layer HE cost drops to ~50 us — completely h
 3. [Hybrid PP-NN (NTU/HintSight)](https://eprint.iacr.org/2023/647)
 4. [PrivTuner — FHE + LoRA (NTU)](https://arxiv.org/abs/2410.00433)
 
-### Techniques We Borrow
-5. [ARION — Double-BSGS attention](https://eprint.iacr.org/2025/2271)
-6. [Euston — SVD-based HMM (S&P 2026)](https://eprint.iacr.org/2026/046)
-7. [CryptoGen — Encrypted KV-cache](https://arxiv.org/abs/2602.08798)
-8. [Encryption-Friendly LLM (ICLR 2025)](https://arxiv.org/abs/2410.02486)
-9. [CryptPEFT — Adapter-only privacy](https://arxiv.org/abs/2412.08145)
-10. [BLB — CKKS↔MPC bridge](https://eprint.iacr.org/2025/1532)
+### Techniques We Compose
+5. [Split-and-Denoise — DP for split learning (ICML 2024)](https://arxiv.org/abs/2310.09130)
+6. [Side-Tuning — Parallel adapter validation (ECCV 2020)](https://arxiv.org/abs/1912.13503)
+7. [MAM Adapters — Parallel adapter quality (ICLR 2022)](https://openreview.net/forum?id=0RDcd5Axok)
+8. [LLaMA-Adapter — Zero-init parallel injection (ICLR 2024)](https://arxiv.org/abs/2303.16199)
+9. [CryptPEFT — Adapter-only privacy (arXiv 2024)](https://arxiv.org/abs/2412.08145)
+10. [Encryption-Friendly LLM (ICLR 2025)](https://arxiv.org/abs/2410.02486)
 
-### The Competition (Full Encrypted Inference)
+### The Competition
 11. [NEXUS (NDSS 2025)](https://eprint.iacr.org/2024/136.pdf)
 12. [THOR (CCS 2025)](https://eprint.iacr.org/2024/1881.pdf)
 13. [BOLT (S&P 2024)](https://www.semanticscholar.org/paper/BOLT:-Privacy-Preserving,-Accurate-and-Efficient-Pang-Zhu/0f7bbe9837026560a934de8a74d233678bd55f57)
 14. [BumbleBee (NDSS 2025)](https://www.ndss-symposium.org/wp-content/uploads/2025-57-paper.pdf)
-15. [STIP (ePrint 2026)](https://eprint.iacr.org/2026/174)
-16. [Cachemir (arXiv 2025)](https://arxiv.org/abs/2602.11470)
+15. [Euston (S&P 2026)](https://eprint.iacr.org/2026/046)
+16. [STIP (ePrint 2026)](https://eprint.iacr.org/2026/174)
 
-### Architecture Design
-17. [StriaNet — Zero-rotation NN design](https://arxiv.org/abs/2601.21287)
-18. [Split HE (arXiv 2022)](https://arxiv.org/abs/2202.13351)
-19. [Iron (NeurIPS 2022)](https://papers.neurips.cc/paper_files/paper/2022/file/64e2449d74f84e5b1a5c96ba7b3d308e-Paper-Conference.pdf)
+### Privacy Attacks (Threat Model Validation)
+17. [Prompt Inversion Attack (CCS 2025)](https://dl.acm.org/doi/pdf/10.1145/3719027.3744820)
+18. [Constrained Optimization Inversion (arXiv 2025)](https://arxiv.org/html/2503.09022v1)
+19. [Embedding Inversion (arXiv 2024)](https://arxiv.org/html/2405.11916)
+20. [Model Inversion in Split Learning (arXiv 2025)](https://arxiv.org/html/2501.05965)
 
 ### Surveys
-20. [Survey on Private Transformer Inference](https://arxiv.org/abs/2412.08145)
 21. [SoK: Private DNN Inference with FHE (2026)](https://eprint.iacr.org/2026/047)
-
-### GPU Libraries
-22. [Phantom — CUDA HE](https://github.com/encryptorion-lab/phantom-fhe)
-23. [FIDESlib — CKKS on GPU](https://arxiv.org/abs/2507.04775)
-24. [Lattigo — Go HE](https://github.com/tuneinsight/lattigo)
+22. [Survey on Private Transformer Inference](https://arxiv.org/abs/2412.08145)
